@@ -1,0 +1,65 @@
+version: 2
+
+before:
+  hooks:
+    - go mod tidy
+
+builds:
+  - env:
+      - CGO_ENABLED=0
+    goos:
+      - linux
+      - darwin
+    goarch:
+      - amd64
+      - arm64
+    ldflags:
+      - -s -w
+      - -X main.version={{.Version}}
+      - -X main.commit={{.Commit}}
+      - -X main.date={{.Date}}
+
+archives:
+  - format: tar.gz
+    files:
+      - LICENSE
+
+checksum:
+  name_template: 'checksums.txt'
+
+changelog:
+  sort: asc
+  filters:
+    exclude:
+      - '^docs:'
+      - '^test:'
+      - '^ci:'
+      - '^chore:'
+
+release:
+  prerelease: auto
+  footer: |
+    ## Installation
+
+    **Homebrew (macOS/Linux):**
+    ```bash
+    brew install ihavespoons/tap/claudette
+    ```
+
+    **Go install:**
+    ```bash
+    go install github.com/ihavespoons/claudette-server@latest
+    ```
+
+brews:
+  - name: claudette
+    repository:
+      owner: ihavespoons
+      name: homebrew-tap
+      token: "{{ .Env.HOMEBREW_TAP_TOKEN }}"
+    directory: Formula
+    homepage: "https://github.com/ihavespoons/claudette-server"
+    description: "Claudette server - bridges Claude Code to mobile"
+    license: "GPL-3.0"
+    test: |
+      system "#{bin}/claudette-server", "-version"
