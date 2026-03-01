@@ -27,8 +27,8 @@ func GenerateQR(relayURL, agentID, secret string) (string, error) {
 		return "", fmt.Errorf("marshal pairing info: %w", err)
 	}
 
-	// Use the claudette:// scheme for deep linking.
-	uri := fmt.Sprintf("claudette://%s", string(data))
+	// Use the transitive:// scheme for deep linking.
+	uri := fmt.Sprintf("transitive://%s", string(data))
 
 	qr, err := qrcode.New(uri, qrcode.Medium)
 	if err != nil {
@@ -46,7 +46,7 @@ func PrintQR(relayURL, agentID, secret string) error {
 	}
 
 	fmt.Println()
-	fmt.Println("Scan this QR code with the Claudette iOS app:")
+	fmt.Println("Scan this QR code with the Transitive iOS app:")
 	fmt.Println()
 	fmt.Print(art)
 	fmt.Println()

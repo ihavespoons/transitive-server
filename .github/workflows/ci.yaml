@@ -56,4 +56,4 @@ jobs:
         env:
           GOOS: ${{ matrix.goos }}
           GOARCH: ${{ matrix.goarch }}
-        run: go build -o claudette-server-${{ matrix.goos }}-${{ matrix.goarch }} .
+        run: go build -o transitive-server-${{ matrix.goos }}-${{ matrix.goarch }} .

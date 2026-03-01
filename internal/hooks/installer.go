@@ -16,14 +16,21 @@ var hookEvents = []string{
 	"Stop",
 }
 
-// hookEntry represents a single hook in Claude settings.
+// hookEntry represents a single hook command inside a matcher group.
 type hookEntry struct {
 	Type    string `json:"type"`
 	Command string `json:"command"`
+	Timeout int    `json:"timeout"`
+}
+
+// hookGroup represents the new matcher-based hook format.
+type hookGroup struct {
+	Matcher string      `json:"matcher"`
+	Hooks   []hookEntry `json:"hooks"`
 }
 
 // Install writes hook configuration to ~/.claude/settings.json.
-func Install(hookScriptPath string, port int) error {
+func Install(binaryPath string, port int) error {
 	settingsPath := filepath.Join(os.Getenv("HOME"), ".claude", "settings.json")
 
 	// Read existing settings or start fresh.
@@ -43,39 +50,39 @@ func Install(hookScriptPath string, port int) error {
 		}
 	}
 
-	command := fmt.Sprintf("CLAUDETTE_PORT=%d bash %s", port, hookScriptPath)
+	command := fmt.Sprintf("TRANSITIVE_PORT=%d %s hook", port, binaryPath)
 
-	for _, event := range hookEvents {
-		entry := hookEntry{
+	newGroup := hookGroup{
+		Matcher: "",
+		Hooks: []hookEntry{{
 			Type:    "command",
 			Command: command,
-		}
+			Timeout: 300,
+		}},
+	}
 
+	for _, event := range hookEvents {
 		var eventHooks []any
 		if existing, ok := hooks[event]; ok {
 			if arr, ok := existing.([]any); ok {
-				// Check if we already have a claudette hook.
 				alreadyInstalled := false
-				for _, h := range arr {
-					if m, ok := h.(map[string]any); ok {
-						if cmd, ok := m["command"].(string); ok {
-							if isClaudetteHook(cmd) {
-								alreadyInstalled = true
-								m["command"] = command // Update in place.
-								break
-							}
-						}
+				for i, h := range arr {
+					if isTransitiveEntry(h) {
+						// Replace with new format.
+						arr[i] = newGroup
+						alreadyInstalled = true
+						break
 					}
 				}
 				if alreadyInstalled {
 					eventHooks = arr
 				} else {
-					eventHooks = append(arr, entry)
+					eventHooks = append(arr, newGroup)
 				}
 			}
 		}
 		if eventHooks == nil {
-			eventHooks = []any{entry}
+			eventHooks = []any{newGroup}
 		}
 		hooks[event] = eventHooks
 	}
@@ -100,7 +107,7 @@ func Install(hookScriptPath string, port int) error {
 	return nil
 }
 
-// Uninstall removes claudette hooks from ~/.claude/settings.json.
+// Uninstall removes transitive hooks from ~/.claude/settings.json.
 func Uninstall() error {
 	settingsPath := filepath.Join(os.Getenv("HOME"), ".claude", "settings.json")
 
@@ -136,10 +143,8 @@ func Uninstall() error {
 
 		var filtered []any
 		for _, h := range arr {
-			if m, ok := h.(map[string]any); ok {
-				if cmd, ok := m["command"].(string); ok && isClaudetteHook(cmd) {
-					continue
-				}
+			if isTransitiveEntry(h) {
+				continue
 			}
 			filtered = append(filtered, h)
 		}
@@ -163,8 +168,34 @@ func Uninstall() error {
 	return os.WriteFile(settingsPath, out, 0o644)
 }
 
-func isClaudetteHook(cmd string) bool {
-	return len(cmd) > 0 && (contains(cmd, "claudette-hook") || contains(cmd, "CLAUDETTE_PORT"))
+// isTransitiveEntry checks if a hook entry (old or new format) is a transitive hook.
+func isTransitiveEntry(h any) bool {
+	m, ok := h.(map[string]any)
+	if !ok {
+		return false
+	}
+
+	// Old format: {"type": "command", "command": "TRANSITIVE_PORT=..."}
+	if cmd, ok := m["command"].(string); ok {
+		return isTransitiveCommand(cmd)
+	}
+
+	// New format: {"matcher": "", "hooks": [{"command": "TRANSITIVE_PORT=..."}]}
+	if hooksArr, ok := m["hooks"].([]any); ok {
+		for _, inner := range hooksArr {
+			if im, ok := inner.(map[string]any); ok {
+				if cmd, ok := im["command"].(string); ok && isTransitiveCommand(cmd) {
+					return true
+				}
+			}
+		}
+	}
+
+	return false
+}
+
+func isTransitiveCommand(cmd string) bool {
+	return len(cmd) > 0 && (contains(cmd, "transitive-hook") || contains(cmd, "TRANSITIVE_PORT") || contains(cmd, "transitive hook"))
 }
 
 func contains(s, sub string) bool {

@@ -1,16 +1,17 @@
 package instance
 
 import (
-	"bufio"
-	"encoding/json"
+	"context"
 	"fmt"
 	"log"
 	"os"
 	"os/exec"
+	"path/filepath"
 	"strings"
 	"sync"
 
-	"github.com/ihavespoons/claudette-server/internal/protocol"
+	"github.com/ihavespoons/transitive/internal/backend"
+	"github.com/ihavespoons/transitive/internal/protocol"
 	"github.com/google/uuid"
 )
 
@@ -22,41 +23,23 @@ type ManagedInstance struct {
 	cwd            string
 	model          string
 	permissionMode string
-	claudePath     string
+	backendID      string
+	backend        backend.Backend
 	status         string
 	sink           EventSink
 	mu             sync.Mutex
 	busy           bool // true while a prompt is being processed
 	hasSession     bool // true after first successful prompt
+	onPersist      func() // called when state changes that should be persisted
+	repoURL       string
+	bootstrapDone chan struct{} // closed when bootstrap completes (success or failure)
+	bootstrapErr  error
+	permResolver  *backend.ChanPermissionResolver // set for opencode instances
+	onPermEmit    func(requestID, instanceID string) // registers requestID with router
+	cancelPrompt  context.CancelFunc // cancels the currently running prompt
 }
 
-// stream-json event types from Claude CLI.
-type streamEvent struct {
-	Type    string          `json:"type"`
-	Subtype string          `json:"subtype,omitempty"`
-	Content json.RawMessage `json:"content,omitempty"`
-
-	// For "result" type
-	Result    string  `json:"result,omitempty"`
-	CostUSD   float64 `json:"cost_usd,omitempty"`
-	Duration  float64 `json:"duration_ms,omitempty"`
-	SessionID string  `json:"session_id,omitempty"`
-	IsError   bool    `json:"is_error,omitempty"`
-}
-
-type toolUseContent struct {
-	ID    string          `json:"id"`
-	Name  string          `json:"name"`
-	Input json.RawMessage `json:"input"`
-}
-
-type toolResultContent struct {
-	ToolUseID string `json:"tool_use_id"`
-	Content   string `json:"content"`
-	IsError   bool   `json:"is_error"`
-}
-
-func NewManagedInstance(cwd, model, permissionMode, claudePath string, sink EventSink) *ManagedInstance {
+func NewManagedInstance(cwd, model, permissionMode, repoURL string, b backend.Backend, sink EventSink) *ManagedInstance {
 	cwd = strings.TrimSpace(cwd)
 	if strings.HasPrefix(cwd, "~") {
 		if home, err := os.UserHomeDir(); err == nil {
@@ -64,19 +47,78 @@ func NewManagedInstance(cwd, model, permissionMode, claudePath string, sink Even
 		}
 	}
 
-	if err := os.MkdirAll(cwd, 0755); err != nil {
-		log.Printf("failed to create working directory %s: %v", cwd, err)
+	if repoURL == "" {
+		// Only pre-create the directory when there's no repo to clone.
+		// When cloning, git will create the target directory itself.
+		if err := os.MkdirAll(cwd, 0755); err != nil {
+			log.Printf("failed to create working directory %s: %v", cwd, err)
+		}
 	}
 
-	return &ManagedInstance{
+	m := &ManagedInstance{
 		id:             uuid.New().String(),
 		sessionID:      uuid.New().String(),
 		cwd:            cwd,
 		model:          model,
 		permissionMode: permissionMode,
-		claudePath:     claudePath,
+		backendID:      b.ID(),
+		backend:        b,
 		status:         "running",
 		sink:           sink,
+		repoURL:        repoURL,
+	}
+	if b.ID() == "opencode" {
+		m.permResolver = backend.NewChanPermissionResolver()
+	}
+	if repoURL != "" {
+		m.bootstrapDone = make(chan struct{})
+	}
+	return m
+}
+
+// NewManagedInstanceFromSession creates a ManagedInstance that resumes an existing session.
+// Used when promoting an AttachedInstance so it can receive prompts.
+func NewManagedInstanceFromSession(id, sessionID, cwd string, b backend.Backend, sink EventSink) *ManagedInstance {
+	return &ManagedInstance{
+		id:         id,
+		sessionID:  sessionID,
+		cwd:        cwd,
+		backendID:  b.ID(),
+		backend:    b,
+		status:     "running",
+		sink:       sink,
+		hasSession: true,
+	}
+}
+
+// NewManagedInstanceFromPersisted creates a stopped ManagedInstance from persisted state.
+func NewManagedInstanceFromPersisted(p PersistedInstance, b backend.Backend, sink EventSink) *ManagedInstance {
+	return &ManagedInstance{
+		id:             p.ID,
+		sessionID:      p.SessionID,
+		cwd:            p.Cwd,
+		model:          p.Model,
+		permissionMode: p.PermissionMode,
+		backendID:      b.ID(),
+		backend:        b,
+		status:         "stopped",
+		sink:           sink,
+		hasSession:     p.HasSession,
+	}
+}
+
+// Persist exports the current instance state for serialization.
+func (m *ManagedInstance) Persist() PersistedInstance {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	return PersistedInstance{
+		ID:             m.id,
+		SessionID:      m.sessionID,
+		Cwd:            m.cwd,
+		Model:          m.model,
+		PermissionMode: m.permissionMode,
+		HasSession:     m.hasSession,
+		BackendID:      m.backendID,
 	}
 }
 
@@ -84,11 +126,24 @@ func (m *ManagedInstance) ID() string        { return m.id }
 func (m *ManagedInstance) SessionID() string  { return m.sessionID }
 func (m *ManagedInstance) Cwd() string        { return m.cwd }
 func (m *ManagedInstance) Type() string       { return "managed" }
+func (m *ManagedInstance) BackendID() string  { return m.backendID }
 
 func (m *ManagedInstance) Status() string {
 	m.mu.Lock()
 	defer m.mu.Unlock()
 	return m.status
+}
+
+func (m *ManagedInstance) Model() string {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	return m.model
+}
+
+func (m *ManagedInstance) PermissionMode() string {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	return m.permissionMode
 }
 
 func (m *ManagedInstance) Info() protocol.InstanceInfo {
@@ -98,14 +153,36 @@ func (m *ManagedInstance) Info() protocol.InstanceInfo {
 		Status:     m.Status(),
 		Cwd:        m.cwd,
 		Type:       "managed",
+		BackendID:  m.backendID,
 	}
 }
 
 func (m *ManagedInstance) Stop() error {
 	m.mu.Lock()
-	defer m.mu.Unlock()
 	m.status = "stopped"
+	cancel := m.cancelPrompt
+	m.mu.Unlock()
+
+	// Cancel the running prompt first.
+	if cancel != nil {
+		cancel()
+	}
+
+	// Stop the OpenCode server process if this is an opencode backend.
+	if ocb, ok := m.backend.(*backend.OpenCodeBackend); ok {
+		ocb.StopServer(m.id)
+	}
 	return nil
+}
+
+// CancelPrompt aborts the currently running prompt without stopping the instance.
+func (m *ManagedInstance) CancelPrompt() {
+	m.mu.Lock()
+	cancel := m.cancelPrompt
+	m.mu.Unlock()
+	if cancel != nil {
+		cancel()
+	}
 }
 
 // UpdateConfig updates the model and/or permission mode for subsequent prompts.
@@ -128,7 +205,67 @@ func (m *ManagedInstance) Resume() error {
 	return nil
 }
 
-// SendPrompt spawns a claude process for this message, streams output, then exits.
+// StartBootstrap kicks off the clone in a background goroutine.
+// Call this right after creating the instance so the UI sees progress immediately.
+func (m *ManagedInstance) StartBootstrap() {
+	if m.bootstrapDone == nil {
+		return
+	}
+	go m.bootstrap()
+}
+
+// bootstrap clones the repository into the instance's working directory.
+func (m *ManagedInstance) bootstrap() {
+	defer close(m.bootstrapDone)
+
+	m.emit(protocol.TypeNotification, protocol.Notification{
+		InstanceID: m.id,
+		Type:       "bootstrap",
+		Message:    m.repoURL,
+	})
+
+	// Ensure the parent directory exists; git clone will create m.cwd itself.
+	if err := os.MkdirAll(filepath.Dir(m.cwd), 0755); err != nil {
+		m.bootstrapErr = fmt.Errorf("failed to create parent directory: %w", err)
+		m.emit(protocol.TypeNotification, protocol.Notification{
+			InstanceID: m.id,
+			Type:       "error",
+			Message:    fmt.Sprintf("Failed to create directory: %v", err),
+		})
+		return
+	}
+
+	cmd := exec.Command("git", "clone", m.repoURL, m.cwd)
+
+	output, err := cmd.CombinedOutput()
+	if len(output) > 0 {
+		m.emit(protocol.TypeNotification, protocol.Notification{
+			InstanceID: m.id,
+			Type:       "bootstrap",
+			Message:    string(output),
+		})
+	}
+
+	if err != nil {
+		m.bootstrapErr = fmt.Errorf("git clone failed: %w", err)
+		m.emit(protocol.TypeNotification, protocol.Notification{
+			InstanceID: m.id,
+			Type:       "error",
+			Message:    fmt.Sprintf("Failed to clone repository: %v", err),
+		})
+		log.Printf("[managed %s] bootstrap failed: %v", m.id, err)
+		return
+	}
+
+	m.emit(protocol.TypeNotification, protocol.Notification{
+		InstanceID: m.id,
+		Type:       "bootstrap_complete",
+		Message:    "Repository cloned successfully",
+	})
+	log.Printf("[managed %s] bootstrap complete: %s", m.id, m.repoURL)
+}
+
+// SendPrompt spawns a backend process for this message, streams output, then exits.
 func (m *ManagedInstance) SendPrompt(text string) error {
 	m.mu.Lock()
 	if m.busy {
@@ -136,110 +273,122 @@ func (m *ManagedInstance) SendPrompt(text string) error {
 		return fmt.Errorf("instance is busy processing another prompt")
 	}
 	m.busy = true
+	ctx, cancel := context.WithCancel(context.Background())
+	m.cancelPrompt = cancel
 	m.mu.Unlock()
 
-	go m.runPrompt(text)
+	go m.runPrompt(ctx, text)
 	return nil
 }
 
-func (m *ManagedInstance) runPrompt(text string) {
+func (m *ManagedInstance) runPrompt(ctx context.Context, text string) {
 	defer func() {
 		m.mu.Lock()
 		m.busy = false
+		m.cancelPrompt = nil
 		m.mu.Unlock()
 	}()
 
+	// Wait for bootstrap (clone) to finish before running the prompt.
+	if m.bootstrapDone != nil {
+		<-m.bootstrapDone
+		if m.bootstrapErr != nil {
+			m.emit(protocol.TypeNotification, protocol.Notification{
+				InstanceID: m.id,
+				Type:       "error",
+				Message:    fmt.Sprintf("Cannot run prompt: repository clone failed: %v", m.bootstrapErr),
+			})
+			return
+		}
+	}
+
 	m.mu.Lock()
 	hasSession := m.hasSession
+	model := m.model
 	m.mu.Unlock()
 
-	args := []string{
-		"-p", text,
-		"--output-format", "stream-json",
-		"--verbose",
-	}
-	if hasSession {
-		args = append(args, "--resume", m.sessionID)
-	} else {
-		args = append(args, "--session-id", m.sessionID)
-	}
-	if m.model != "" {
-		args = append(args, "--model", m.model)
-	}
-	if m.permissionMode != "" {
-		args = append(args, "--permission-mode", m.permissionMode)
-	}
-
-	cmd := exec.Command(m.claudePath, args...)
-	cmd.Dir = m.cwd
-
-	// Clear Claude Code env vars to avoid nested session detection.
-	env := os.Environ()
-	filtered := env[:0]
-	for _, e := range env {
-		if !strings.HasPrefix(e, "CLAUDECODE=") && !strings.HasPrefix(e, "CLAUDE_CODE_ENTRYPOINT=") {
-			filtered = append(filtered, e)
-		}
-	}
-	cmd.Env = filtered
-
-	stdout, err := cmd.StdoutPipe()
-	if err != nil {
-		log.Printf("[managed %s] stdout pipe: %v", m.id, err)
-		return
+	opts := backend.RunOpts{
+		Ctx:        ctx,
+		InstanceID: m.id,
+		SessionID:  m.sessionID,
+		HasSession: hasSession,
+		Cwd:        m.cwd,
+		Model:      model,
+		Prompt:     text,
+		Emitter:    m.emitFromBackend,
+		OnSessionID: func(sessionID string) {
+			m.mu.Lock()
+			wasNew := !m.hasSession
+			m.sessionID = sessionID
+			m.hasSession = true
+			cb := m.onPersist
+			m.mu.Unlock()
+			if wasNew && cb != nil {
+				cb()
+			}
+		},
+		PermissionResolver: m.permResolver,
 	}
 
-	stderr, err := cmd.StderrPipe()
-	if err != nil {
-		log.Printf("[managed %s] stderr pipe: %v", m.id, err)
-		return
+	if err := m.backend.RunPrompt(opts); err != nil {
+		log.Printf("[managed %s] backend.RunPrompt error: %v", m.id, err)
 	}
 
-	log.Printf("[managed %s] starting: claude -p %q --resume %s", m.id, text, m.sessionID)
-	if err := cmd.Start(); err != nil {
-		log.Printf("[managed %s] start failed: %v", m.id, err)
-		m.emit(protocol.TypeNotification, protocol.Notification{
+	// If the prompt was cancelled (context done), emit instance.stopped so the
+	// iOS UI resets streaming/thinking state.
+	if ctx.Err() != nil {
+		m.emit(protocol.TypeInstanceStopped, protocol.InstanceStopped{
 			InstanceID: m.id,
-			Type:       "error",
-			Message:    fmt.Sprintf("failed to start claude: %v", err),
+			Reason:     "turn_complete",
 		})
-		return
 	}
+}
 
-	// Read stderr in background.
-	go func() {
-		scanner := bufio.NewScanner(stderr)
-		for scanner.Scan() {
-			log.Printf("[managed %s stderr] %s", m.id, scanner.Text())
+// emitFromBackend is the StreamEmitter callback used by backends.
+// It also intercepts system events to update local model/permissionMode state,
+// and registers permission/question requestIDs with the router for OpenCode instances.
+func (m *ManagedInstance) emitFromBackend(msgType string, payload any) {
+	// Intercept instance.status to update local state.
+	if msgType == protocol.TypeInstanceStatus {
+		if status, ok := payload.(protocol.InstanceStatusMsg); ok {
+			m.mu.Lock()
+			if status.Model != "" {
+				m.model = status.Model
+			}
+			if status.PermissionMode != "" {
+				m.permissionMode = status.PermissionMode
+			}
+			m.mu.Unlock()
 		}
-	}()
-
-	// Stream stdout.
-	scanner := bufio.NewScanner(stdout)
-	scanner.Buffer(make([]byte, 0, 1024*1024), 10*1024*1024)
-	for scanner.Scan() {
-		line := scanner.Bytes()
-		if len(line) == 0 {
-			continue
-		}
-		log.Printf("[managed %s stdout] %s", m.id, string(line))
-
-		var evt streamEvent
-		if err := json.Unmarshal(line, &evt); err != nil {
-			log.Printf("[managed %s] invalid JSON line: %v", m.id, err)
-			continue
-		}
-		m.handleStreamEvent(&evt)
 	}
-	if err := scanner.Err(); err != nil {
-		log.Printf("[managed %s] stream read error: %v", m.id, err)
+	// Register permission/question requestIDs with the router so responses
+	// can be routed back to this instance's PermissionResolver.
+	if m.onPermEmit != nil {
+		if msgType == protocol.TypePermissionRequest {
+			if req, ok := payload.(protocol.PermissionRequestMsg); ok {
+				m.onPermEmit(req.RequestID, m.id)
+			}
+		} else if msgType == protocol.TypeAskUserQuestion {
+			if req, ok := payload.(protocol.AskUserQuestion); ok {
+				m.onPermEmit(req.RequestID, m.id)
+			}
+		}
 	}
+	m.emit(msgType, payload)
+}
 
-	// Wait for process to finish.
-	if err := cmd.Wait(); err != nil {
-		log.Printf("[managed %s] process exited: %v", m.id, err)
-	} else {
-		log.Printf("[managed %s] process exited cleanly", m.id)
+// SetOnPermEmit sets the callback for registering permission request IDs with the router.
+func (m *ManagedInstance) SetOnPermEmit(fn func(requestID, instanceID string)) {
+	m.mu.Lock()
+	m.onPermEmit = fn
+	m.mu.Unlock()
+}
+
+// ResolvePermission forwards a permission/question response to the OpenCode server
+// via the ChanPermissionResolver.
+func (m *ManagedInstance) ResolvePermission(requestID string, response map[string]any) {
+	if m.permResolver != nil {
+		m.permResolver.Resolve(requestID, response)
 	}
 }
 
@@ -253,79 +402,4 @@ func (m *ManagedInstance) emit(msgType string, payload any) {
 		return
 	}
 	m.sink(env)
-}
-
-func (m *ManagedInstance) handleStreamEvent(evt *streamEvent) {
-	switch evt.Type {
-	case "assistant":
-		switch evt.Subtype {
-		case "text":
-			var text string
-			if err := json.Unmarshal(evt.Content, &text); err != nil {
-				log.Printf("[managed %s] invalid text content: %v", m.id, err)
-				return
-			}
-			m.emit(protocol.TypeStreamText, protocol.StreamText{
-				InstanceID: m.id,
-				Text:       text,
-				IsPartial:  true,
-			})
-
-		case "tool_use":
-			var tc toolUseContent
-			if err := json.Unmarshal(evt.Content, &tc); err != nil {
-				log.Printf("[managed %s] invalid tool_use content: %v", m.id, err)
-				return
-			}
-			m.emit(protocol.TypeStreamToolUse, protocol.StreamToolUse{
-				InstanceID: m.id,
-				ToolName:   tc.Name,
-				ToolInput:  tc.Input,
-				ToolUseID:  tc.ID,
-			})
-
-		case "tool_result":
-			var tr toolResultContent
-			if err := json.Unmarshal(evt.Content, &tr); err != nil {
-				log.Printf("[managed %s] invalid tool_result content: %v", m.id, err)
-				return
-			}
-			m.emit(protocol.TypeStreamToolResult, protocol.StreamToolResult{
-				InstanceID: m.id,
-				ToolUseID:  tr.ToolUseID,
-				Output:     tr.Content,
-				IsError:    tr.IsError,
-			})
-		}
-
-	case "result":
-		m.emit(protocol.TypeStreamText, protocol.StreamText{
-			InstanceID: m.id,
-			Text:       evt.Result,
-			IsPartial:  false,
-		})
-		m.emit(protocol.TypeStreamComplete, protocol.StreamComplete{
-			InstanceID: m.id,
-			CostUSD:    evt.CostUSD,
-			DurationMS: int64(evt.Duration),
-		})
-
-		if evt.SessionID != "" {
-			m.mu.Lock()
-			m.sessionID = evt.SessionID
-			m.hasSession = true
-			m.mu.Unlock()
-		}
-
-	case "error":
-		var errMsg string
-		if err := json.Unmarshal(evt.Content, &errMsg); err != nil {
-			errMsg = string(evt.Content)
-		}
-		m.emit(protocol.TypeNotification, protocol.Notification{
-			InstanceID: m.id,
-			Type:       "error",
-			Message:    errMsg,
-		})
-	}
 }

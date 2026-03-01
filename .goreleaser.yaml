@@ -43,23 +43,23 @@ release:
 
     **Homebrew (macOS/Linux):**
     ```bash
-    brew install ihavespoons/tap/claudette
+    brew install ihavespoons/tap/transitive
     ```
 
     **Go install:**
     ```bash
-    go install github.com/ihavespoons/claudette-server@latest
+    go install github.com/ihavespoons/transitive@latest
     ```
 
 brews:
-  - name: claudette
+  - name: transitive
     repository:
       owner: ihavespoons
       name: homebrew-tap
       token: "{{ .Env.HOMEBREW_TAP_TOKEN }}"
     directory: Formula
-    homepage: "https://github.com/ihavespoons/claudette-server"
-    description: "Claudette server - bridges Claude Code to mobile"
+    homepage: "https://github.com/ihavespoons/transitive"
+    description: "Transitive server - bridges Claude Code to mobile"
     license: "GPL-3.0"
     test: |
-      system "#{bin}/claudette-server", "-version"
+      system "#{bin}/transitive-server", "-version"

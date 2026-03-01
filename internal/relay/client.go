@@ -8,7 +8,7 @@ import (
 	"sync"
 	"time"
 
-	"github.com/ihavespoons/claudette-server/internal/protocol"
+	"github.com/ihavespoons/transitive/internal/protocol"
 	"github.com/gorilla/websocket"
 )
 
