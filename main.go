@@ -278,6 +278,21 @@ func main() {
 					eventSink(env)
 				}
 
+			case protocol.TypePortForwardListRequest:
+				var req protocol.PortForwardListRequest
+				if err := json.Unmarshal(env.Payload, &req); err != nil {
+					log.Printf("invalid port_forward.list.request: %v", err)
+					return
+				}
+				fwds := pfMgr.List(req.InstanceID)
+				env, err := protocol.NewEnvelope(protocol.TypePortForwardList, uuid.New().String(), protocol.PortForwardList{
+					InstanceID: req.InstanceID,
+					Forwards:   fwds,
+				})
+				if err == nil {
+					eventSink(env)
+				}
+
 			default:
 				// Clean up shell/port forwards when an instance is stopped or removed.
 				if env.Type == protocol.TypeInstanceStop || env.Type == protocol.TypeInstanceRemove {

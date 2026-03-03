@@ -160,6 +160,22 @@ func (m *Manager) Stop(instanceID string, port int) {
 	log.Printf("[portforward] stopped: instance=%s port=%d", instanceID, port)
 }
 
+// List returns info about all active port forwards for an instance.
+func (m *Manager) List(instanceID string) []protocol.PortForwardInfo {
+	m.mu.Lock()
+	fwds := m.byInst[instanceID]
+	m.mu.Unlock()
+
+	result := make([]protocol.PortForwardInfo, 0, len(fwds))
+	for _, fwd := range fwds {
+		result = append(result, protocol.PortForwardInfo{
+			Port:     fwd.Port,
+			ProxyURL: fwd.ProxyURL,
+		})
+	}
+	return result
+}
+
 // StopAllForInstance removes all port forwards for an instance.
 func (m *Manager) StopAllForInstance(instanceID string) {
 	m.mu.Lock()

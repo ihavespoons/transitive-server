@@ -317,6 +317,20 @@ type PortForwardError struct {
 	Error      string `json:"error"`
 }
 
+type PortForwardListRequest struct {
+	InstanceID string `json:"instance_id"`
+}
+
+type PortForwardList struct {
+	InstanceID string            `json:"instance_id"`
+	Forwards   []PortForwardInfo `json:"forwards"`
+}
+
+type PortForwardInfo struct {
+	Port     int    `json:"port"`
+	ProxyURL string `json:"proxy_url"`
+}
+
 // --- Proxy payloads (relay ↔ server) ---
 
 type ProxyRegister struct {
@@ -402,13 +416,15 @@ const (
 	TypeBgProcessError   = "background.process.error"
 
 	// Port forward (mobile → server)
-	TypePortForwardStart = "port_forward.start"
-	TypePortForwardStop  = "port_forward.stop"
+	TypePortForwardStart       = "port_forward.start"
+	TypePortForwardStop        = "port_forward.stop"
+	TypePortForwardListRequest = "port_forward.list.request"
 
 	// Port forward (server → mobile)
 	TypePortForwardStarted = "port_forward.started"
 	TypePortForwardStopped = "port_forward.stopped"
 	TypePortForwardError   = "port_forward.error"
+	TypePortForwardList    = "port_forward.list"
 
 	// Proxy internal (relay ↔ server)
 	TypeProxyRegister   = "proxy.register"
