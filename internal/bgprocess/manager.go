@@ -166,7 +166,7 @@ func (m *Manager) List(instanceID string) []protocol.BackgroundProcessInfo {
 	procs := m.byInstance[instanceID]
 	m.mu.Unlock()
 
-	var result []protocol.BackgroundProcessInfo
+	result := make([]protocol.BackgroundProcessInfo, 0, len(procs))
 	for _, p := range procs {
 		result = append(result, protocol.BackgroundProcessInfo{
 			ProcessID: p.ID,
