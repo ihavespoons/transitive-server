@@ -114,7 +114,16 @@ func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		}
 	}
 	if instanceID == "" {
-		instanceID = h.ensureAttachedInstance(evt.SessionID, evt.Cwd, claudePID, backendID)
+		if evt.Event == "SessionStart" {
+			// Only create attached instances on SessionStart events.
+			// The OpenCode plugin fires SessionStart on load, so terminal
+			// OpenCode sessions are tracked. Claude Code hooks don't include
+			// SessionStart, so they won't create ghost attached instances.
+			instanceID = h.ensureAttachedInstance(evt.SessionID, evt.Cwd, claudePID, backendID)
+		} else {
+			// For other events, look up existing attached instance by session.
+			instanceID = h.findAttachedInstance(evt.SessionID, claudePID)
+		}
 	}
 
 	switch evt.Event {
@@ -167,16 +176,14 @@ func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	}
 }
 
-// ensureAttachedInstance gets or creates an attached instance for this session.
-func (h *Handler) ensureAttachedInstance(sessionID, cwd string, pid int, backendID string) string {
+// findAttachedInstance looks up an existing attached instance by session ID.
+// Returns the instance ID if found, or "" if the session is not tracked.
+func (h *Handler) findAttachedInstance(sessionID string, pid int) string {
 	if sessionID == "" {
 		return ""
 	}
-
-	// Check if we already track this session.
 	for _, info := range h.manager.List() {
 		if info.SessionID == sessionID {
-			// Update PID on existing attached instance.
 			if pid > 0 {
 				if inst := h.manager.Get(info.InstanceID); inst != nil {
 					if attached, ok := inst.(*instance.AttachedInstance); ok {
@@ -185,6 +192,28 @@ func (h *Handler) ensureAttachedInstance(sessionID, cwd string, pid int, backend
 				}
 			}
 			return info.InstanceID
+		}
+	}
+	return ""
+}
+
+// ensureAttachedInstance gets or creates an attached instance for this session.
+// Only called for SessionStart events to avoid creating ghost instances.
+func (h *Handler) ensureAttachedInstance(sessionID, cwd string, pid int, backendID string) string {
+	if sessionID == "" {
+		return ""
+	}
+
+	// Check if we already track this session.
+	if id := h.findAttachedInstance(sessionID, pid); id != "" {
+		return id
+	}
+
+	// If a managed instance already exists for the same cwd, don't create
+	// a ghost attached instance.
+	for _, info := range h.manager.List() {
+		if info.Type == "managed" && info.Cwd == cwd {
+			return ""
 		}
 	}
 
