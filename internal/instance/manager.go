@@ -120,7 +120,7 @@ func (m *Manager) LoadPersisted() {
 	for _, p := range entries {
 		backendID := p.BackendID
 		if backendID == "" {
-			backendID = "claude"
+			backendID = "opencode"
 		}
 		b := m.registry.Get(backendID)
 		if b == nil {
@@ -175,16 +175,12 @@ func (m *Manager) List() []protocol.InstanceInfo {
 // LaunchManaged creates a new managed instance using the specified backend.
 func (m *Manager) LaunchManaged(cwd, model, permissionMode, backendID, repoURL string) *ManagedInstance {
 	if backendID == "" {
-		backendID = "claude"
+		backendID = "opencode"
 	}
 	b := m.registry.Get(backendID)
 	if b == nil {
-		log.Printf("backend %q not found, falling back to claude", backendID)
-		b = m.registry.Get("claude")
-		if b == nil {
-			log.Printf("no backends available")
-			return nil
-		}
+		log.Printf("backend %q not found", backendID)
+		return nil
 	}
 
 	inst := NewManagedInstance(cwd, model, permissionMode, repoURL, b, m.sink)
@@ -383,10 +379,10 @@ func (m *Manager) adoptAttached(instanceID string) *ManagedInstance {
 		}
 	}
 
-	// Use the backend reported by the attached instance, defaulting to "claude".
+	// Use the backend reported by the attached instance, defaulting to opencode.
 	backendID := attached.BackendID()
 	if backendID == "" {
-		backendID = "claude"
+		backendID = "opencode"
 	}
 	b := m.registry.Get(backendID)
 	if b == nil {
