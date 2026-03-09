@@ -19,6 +19,7 @@ type Config struct {
 	ClaudePath   string `json:"claude_path,omitempty"`
 	OpenCodePath string `json:"opencode_path,omitempty"`
 	ProjectDir   string `json:"project_dir,omitempty"`
+	EnableClaude bool   `json:"enable_claude,omitempty"`
 }
 
 func (c *Config) HookAddr() string {
@@ -86,6 +87,9 @@ func (c *Config) LoadFromFile() error {
 	}
 	if file.ProjectDir != "" {
 		c.ProjectDir = file.ProjectDir
+	}
+	if file.EnableClaude {
+		c.EnableClaude = true
 	}
 
 	log.Printf("loaded config from %s", path)

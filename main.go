@@ -50,6 +50,7 @@ func main() {
 	flag.StringVar(&cfg.ClaudePath, "claude-path", cfg.ClaudePath, "Path to claude CLI")
 	flag.StringVar(&cfg.OpenCodePath, "opencode-path", cfg.OpenCodePath, "Path to opencode CLI")
 	flag.StringVar(&cfg.ProjectDir, "project-dir", cfg.ProjectDir, "Base directory for cloned repositories")
+	flag.BoolVar(&cfg.EnableClaude, "enable-claude", cfg.EnableClaude, "Enable Claude Code backend (experimental)")
 	showVersion := flag.Bool("version", false, "Print version and exit")
 	installHooks := flag.Bool("install-hooks", false, "Install hooks and exit")
 	uninstallHooks := flag.Bool("uninstall-hooks", false, "Uninstall hooks and exit")
@@ -88,8 +89,10 @@ func main() {
 
 	// Install hooks using the current binary.
 	exePath, _ := os.Executable()
-	if err := hooks.Install(exePath, cfg.Port); err != nil {
-		log.Printf("warning: failed to install hooks: %v", err)
+	if cfg.EnableClaude {
+		if err := hooks.Install(exePath, cfg.Port); err != nil {
+			log.Printf("warning: failed to install hooks: %v", err)
+		}
 	}
 	if err := hooks.InstallOpenCode(cfg.Port); err != nil {
 		log.Printf("warning: failed to install OpenCode plugin: %v", err)
@@ -97,7 +100,9 @@ func main() {
 
 	// Create backend registry and register backends.
 	reg := backend.NewRegistry()
-	reg.Register(backend.NewClaudeBackend(cfg.ClaudePath))
+	if cfg.EnableClaude {
+		reg.Register(backend.NewClaudeBackend(cfg.ClaudePath))
+	}
 	reg.Register(backend.NewOpenCodeBackend(cfg.OpenCodePath))
 	reg.RefreshAll()
 
@@ -239,8 +244,16 @@ func main() {
 					log.Printf("invalid background.process.start: %v", err)
 					return
 				}
-				if _, err := bgprocessMgr.Start(req.InstanceID, req.Name, req.Command, req.Port); err != nil {
+				cwd := ""
+				if inst := mgr.Get(req.InstanceID); inst != nil {
+					cwd = inst.Cwd()
+				}
+				if _, err := bgprocessMgr.Start(req.InstanceID, req.Name, req.Command, cwd, req.Port); err != nil {
 					log.Printf("background.process.start error: %v", err)
+				} else if req.Port > 0 {
+					if err := pfMgr.Start(req.InstanceID, req.Port); err != nil {
+						log.Printf("auto port-forward for port %d failed: %v", req.Port, err)
+					}
 				}
 
 			case protocol.TypeBgProcessStop:
@@ -335,8 +348,13 @@ func main() {
 	}
 	pfMgr = portforward.NewManager(portforward.EventSink(eventSink), relayHost, cfg.AgentID)
 
+	// Auto-cleanup port forwards when background processes stop.
+	bgprocessMgr.OnStopped = func(instanceID string, port int) {
+		pfMgr.Stop(instanceID, port)
+	}
+
 	// Hook handler.
-	hookHandler = hooks.NewHandler(mgr, eventSink, bgprocessMgr)
+	hookHandler = hooks.NewHandler(mgr, eventSink, bgprocessMgr, pfMgr)
 
 	// HTTP server for hooks.
 	mux := http.NewServeMux()

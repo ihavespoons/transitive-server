@@ -21,6 +21,10 @@ type Manager struct {
 	byInstance  map[string][]*Process // instanceID → processes
 	sink        EventSink
 
+	// OnStopped is called when a process exits (any reason). Set by the
+	// caller to clean up associated resources like port forwards.
+	OnStopped func(instanceID string, port int)
+
 	// Output batching: collect output per process, flush periodically.
 	batchMu     sync.Mutex
 	batchBufs   map[string][]byte // processID → pending output
@@ -55,13 +59,14 @@ func (m *Manager) emit(msgType string, payload any) {
 }
 
 // Start launches a new background process.
-func (m *Manager) Start(instanceID, name, command string, port int) (string, error) {
+func (m *Manager) Start(instanceID, name, command, cwd string, port int) (string, error) {
 	processID := uuid.New().String()
 	p := &Process{
 		ID:         processID,
 		InstanceID: instanceID,
 		Name:       name,
 		Command:    command,
+		Cwd:        cwd,
 		Port:       port,
 	}
 
@@ -107,17 +112,57 @@ func (m *Manager) Start(instanceID, name, command string, port int) (string, err
 		<-p.Done()
 		m.flushOutput(processID)
 		reason := "exited"
+		errMsg := ""
+		p.mu.Lock()
 		if p.Status == "errored" {
 			reason = "error"
+			errMsg = p.ExitError
+		}
+		p.mu.Unlock()
+		// Include error detail and last output so the agent/UI knows what went wrong.
+		lastOutput := ""
+		if reason == "error" {
+			if out := p.Output(); len(out) > 0 {
+				lastOutput = string(out)
+			}
 		}
 		m.emit(protocol.TypeBgProcessStopped, protocol.BackgroundProcessStopped{
 			InstanceID: instanceID,
 			ProcessID:  processID,
 			Reason:     reason,
+			Error:      errMsg,
+			Output:     lastOutput,
 		})
+		if port > 0 && m.OnStopped != nil {
+			m.OnStopped(instanceID, port)
+		}
 	}()
 
 	return processID, nil
+}
+
+// GetProcess returns the Process for a given ID, or nil if not found.
+func (m *Manager) GetProcess(processID string) *Process {
+	m.mu.Lock()
+	p := m.processes[processID]
+	m.mu.Unlock()
+	return p
+}
+
+// FindRecent returns a running process for this instance with the same command
+// and port that was started within the last 5 seconds. Used to dedup rapid
+// duplicate start requests from the OpenCode tool pipeline.
+func (m *Manager) FindRecent(instanceID, command string, port int) *Process {
+	m.mu.Lock()
+	procs := m.byInstance[instanceID]
+	m.mu.Unlock()
+
+	for _, p := range procs {
+		if p.Command == command && p.Port == port && time.Since(p.StartedAt) < 5*time.Second {
+			return p
+		}
+	}
+	return nil
 }
 
 // Stop terminates a background process.
@@ -137,6 +182,10 @@ func (m *Manager) Stop(processID string) error {
 		Reason:     "stopped",
 	})
 
+	if p.Port > 0 && m.OnStopped != nil {
+		m.OnStopped(p.InstanceID, p.Port)
+	}
+
 	return nil
 }
 
@@ -152,12 +201,13 @@ func (m *Manager) Restart(processID string) (string, error) {
 	instanceID := p.InstanceID
 	name := p.Name
 	command := p.Command
+	cwd := p.Cwd
 	port := p.Port
 
 	p.Stop()
 	m.removeProcess(processID)
 
-	return m.Start(instanceID, name, command, port)
+	return m.Start(instanceID, name, command, cwd, port)
 }
 
 // List returns info about all processes for an instance.

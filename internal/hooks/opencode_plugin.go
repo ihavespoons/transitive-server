@@ -73,39 +73,10 @@ const plugin: Plugin = (ctx) => {
   // the SSE/REST permission flow. Only attached (terminal) instances use hooks.
   const isManaged = !!managedInstanceId;
 
-  // Register the background_process tool.
-  if ((ctx as any).registerTool) {
-    (ctx as any).registerTool({
-      name: "background_process",
-      description: "Start, stop, restart, or list background processes (web servers, watchers, etc.)",
-      parameters: {
-        type: "object",
-        properties: {
-          action: { type: "string", enum: ["start", "stop", "restart", "list"], description: "Action to perform" },
-          command: { type: "string", description: "Shell command to run (for start)" },
-          name: { type: "string", description: "Human-readable name (for start)" },
-          process_id: { type: "string", description: "Process ID (for stop/restart)" },
-          port: { type: "number", description: "Port the process listens on (optional, for start)" },
-        },
-        required: ["action"],
-      },
-      execute: async (args: any) => {
-        const event = {
-          session_id: sessionId,
-          hook_event_name: "PreToolUse",
-          tool_name: "background_process",
-          tool_input: args,
-          cwd: ctx.directory,
-        };
-        const resp = await postHook(event);
-        return resp;
-      },
-    });
-  }
-
   return {
     "tool.execute.before": async (input, output) => {
       if (isManaged) return; // managed instances handle permissions via SSE
+      if (input.tool === "background_process") return; // handled by custom tool
       const event = {
         session_id: input.sessionID || sessionId,
         hook_event_name: "PreToolUse",
@@ -122,6 +93,7 @@ const plugin: Plugin = (ctx) => {
 
     "tool.execute.after": async (input, output) => {
       if (isManaged) return; // managed instances get tool results via SSE
+      if (input.tool === "background_process") return; // handled by custom tool
       fireAndForget({
         session_id: input.sessionID || sessionId,
         hook_event_name: "PostToolUse",
@@ -154,8 +126,13 @@ const plugin: Plugin = (ctx) => {
     },
 
     "permission.ask": async (input, output) => {
-      if (isManaged) return; // managed instances handle permissions via SSE
       const perm = input as any;
+      const toolName = perm.title || perm.type || "unknown";
+      if (toolName === "background_process") {
+        output.status = "allow"; // auto-allow for all instances; the custom tool handles execution
+        return;
+      }
+      if (isManaged) return; // managed instances handle permissions via SSE
       const event = {
         session_id: perm.sessionID || sessionId,
         hook_event_name: "PreToolUse",
@@ -178,6 +155,58 @@ const plugin: Plugin = (ctx) => {
 export default plugin;
 `
 
+// openCodeToolSource is the TypeScript custom tool for background process management.
+// Placed in ~/.config/opencode/tools/ so OpenCode discovers it as a tool the agent can call.
+const openCodeToolSource = `import { tool } from "@opencode-ai/plugin";
+
+const PORT = parseInt(process.env.TRANSITIVE_PORT || "7865", 10);
+const HOOK_URL = ` + "`" + `http://localhost:${PORT}/hook` + "`" + `;
+const instanceId = process.env.TRANSITIVE_INSTANCE_ID || "";
+
+export default tool({
+  description: "Manage background processes. Use action 'start' with a command (and optional name/port), 'stop' or 'restart' with a process_id, or 'list' to see all processes.",
+  args: {
+    action: tool.schema.string().describe("Action to perform: start, stop, restart, or list"),
+    command: tool.schema.string().optional().describe("Shell command to run (required for 'start')"),
+    name: tool.schema.string().optional().describe("Display name for the process (optional, defaults to command)"),
+    port: tool.schema.number().optional().describe("Port the process will listen on (optional)"),
+    process_id: tool.schema.string().optional().describe("Process ID (required for 'stop' and 'restart')"),
+  },
+  async execute(args, context) {
+    try {
+      const resp = await fetch(HOOK_URL, {
+        method: "POST",
+        headers: {
+          "Content-Type": "application/json",
+          "X-Backend": "opencode",
+          ...(instanceId ? { "X-Instance-ID": instanceId } : {}),
+        },
+        body: JSON.stringify({
+          session_id: context.sessionID || "",
+          hook_event_name: "PreToolUse",
+          tool_name: "background_process",
+          tool_input: args,
+          cwd: context.directory || "",
+        }),
+      });
+      const data = await resp.json() as any;
+      return JSON.stringify(data.toolResult || data, null, 2);
+    } catch (err: any) {
+      return JSON.stringify({ error: "Failed to reach transitive server: " + err.message });
+    }
+  },
+});
+`
+
+// openCodeToolPath returns the path where the custom tool file is installed.
+func openCodeToolPath() string {
+	home, err := os.UserHomeDir()
+	if err != nil {
+		return ""
+	}
+	return filepath.Join(home, ".config", "opencode", "tools", "background_process.ts")
+}
+
 // openCodePluginPath returns the path where the plugin file is installed.
 func openCodePluginPath() string {
 	home, err := os.UserHomeDir()
@@ -187,7 +216,7 @@ func openCodePluginPath() string {
 	return filepath.Join(home, ".config", "opencode", "plugins", "transitive.ts")
 }
 
-// InstallOpenCode writes the TypeScript plugin to ~/.config/opencode/plugins/transitive.ts.
+// InstallOpenCode writes the TypeScript plugin and custom tool files.
 func InstallOpenCode(port int) error {
 	pluginPath := openCodePluginPath()
 	if pluginPath == "" {
@@ -202,12 +231,25 @@ func InstallOpenCode(port int) error {
 	if err := os.WriteFile(pluginPath, []byte(openCodePluginSource), 0o644); err != nil {
 		return fmt.Errorf("write plugin: %w", err)
 	}
-
 	log.Printf("OpenCode plugin installed at %s", pluginPath)
+
+	// Install background_process custom tool.
+	toolPath := openCodeToolPath()
+	if toolPath != "" {
+		toolDir := filepath.Dir(toolPath)
+		if err := os.MkdirAll(toolDir, 0o755); err != nil {
+			return fmt.Errorf("create tool dir: %w", err)
+		}
+		if err := os.WriteFile(toolPath, []byte(openCodeToolSource), 0o644); err != nil {
+			return fmt.Errorf("write tool: %w", err)
+		}
+		log.Printf("OpenCode custom tool installed at %s", toolPath)
+	}
+
 	return nil
 }
 
-// UninstallOpenCode removes the plugin file.
+// UninstallOpenCode removes the plugin and custom tool files.
 func UninstallOpenCode() error {
 	pluginPath := openCodePluginPath()
 	if pluginPath == "" {
@@ -217,6 +259,15 @@ func UninstallOpenCode() error {
 		return fmt.Errorf("remove plugin: %w", err)
 	}
 	log.Printf("OpenCode plugin removed from %s", pluginPath)
+
+	toolPath := openCodeToolPath()
+	if toolPath != "" {
+		if err := os.Remove(toolPath); err != nil && !os.IsNotExist(err) {
+			return fmt.Errorf("remove tool: %w", err)
+		}
+		log.Printf("OpenCode custom tool removed from %s", toolPath)
+	}
+
 	return nil
 }
 

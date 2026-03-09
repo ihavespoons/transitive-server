@@ -16,9 +16,11 @@ type Process struct {
 	InstanceID string
 	Name       string
 	Command    string
+	Cwd        string // working directory for the process
 	Port       int
 	Pid        int
 	Status     string // "running", "stopped", "errored"
+	ExitError  string // error message from Wait(), if any
 	StartedAt  time.Time
 
 	cmd    *exec.Cmd
@@ -31,6 +33,9 @@ type Process struct {
 func (p *Process) Start() error {
 	p.cmd = exec.Command("sh", "-c", p.Command)
 	p.cmd.SysProcAttr = &syscall.SysProcAttr{Setpgid: true}
+	if p.Cwd != "" {
+		p.cmd.Dir = p.Cwd
+	}
 
 	pr, pw := io.Pipe()
 	p.cmd.Stdout = pw
@@ -68,6 +73,7 @@ func (p *Process) Start() error {
 		p.mu.Lock()
 		if err != nil {
 			p.Status = "errored"
+			p.ExitError = err.Error()
 		} else {
 			p.Status = "stopped"
 		}

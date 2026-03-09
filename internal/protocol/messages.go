@@ -236,6 +236,8 @@ type BackgroundProcessStopped struct {
 	InstanceID string `json:"instance_id"`
 	ProcessID  string `json:"process_id"`
 	Reason     string `json:"reason"`
+	Error      string `json:"error,omitempty"`
+	Output     string `json:"output,omitempty"`
 }
 
 type BackgroundProcessOutput struct {

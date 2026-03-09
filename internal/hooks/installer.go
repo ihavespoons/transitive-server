@@ -195,7 +195,8 @@ func isTransitiveEntry(h any) bool {
 }
 
 func isTransitiveCommand(cmd string) bool {
-	return len(cmd) > 0 && (contains(cmd, "transitive-hook") || contains(cmd, "TRANSITIVE_PORT") || contains(cmd, "transitive hook"))
+	return len(cmd) > 0 && (contains(cmd, "transitive-hook") || contains(cmd, "TRANSITIVE_PORT") || contains(cmd, "transitive hook") ||
+		contains(cmd, "claudette-hook") || contains(cmd, "CLAUDETTE_PORT") || contains(cmd, "claudette hook"))
 }
 
 func contains(s, sub string) bool {

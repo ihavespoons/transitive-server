@@ -14,6 +14,7 @@ import (
 
 	"github.com/ihavespoons/transitive/internal/bgprocess"
 	"github.com/ihavespoons/transitive/internal/instance"
+	"github.com/ihavespoons/transitive/internal/portforward"
 	"github.com/ihavespoons/transitive/internal/protocol"
 	"github.com/google/uuid"
 )
@@ -44,19 +45,21 @@ type pendingPermission struct {
 
 // Handler is the HTTP handler for hook POSTs.
 type Handler struct {
-	manager    *instance.Manager
-	sink       instance.EventSink
-	bgprocess  *bgprocess.Manager
+	manager      *instance.Manager
+	sink         instance.EventSink
+	bgprocess    *bgprocess.Manager
+	portforward  *portforward.Manager
 
 	permMu      sync.Mutex
 	permissions map[string]*pendingPermission
 }
 
-func NewHandler(mgr *instance.Manager, sink instance.EventSink, bgMgr *bgprocess.Manager) *Handler {
+func NewHandler(mgr *instance.Manager, sink instance.EventSink, bgMgr *bgprocess.Manager, pfMgr *portforward.Manager) *Handler {
 	return &Handler{
 		manager:     mgr,
 		sink:        sink,
 		bgprocess:   bgMgr,
+		portforward: pfMgr,
 		permissions: make(map[string]*pendingPermission),
 	}
 }
@@ -334,6 +337,7 @@ func (h *Handler) handlePreToolUse(w http.ResponseWriter, instanceID string, evt
 
 	// background_process tool: auto-allow and handle directly.
 	if evt.ToolName == "background_process" {
+		log.Printf("[hooks] routing background_process: instance=%s session=%s", instanceID, evt.SessionID)
 		h.handleBackgroundProcess(w, instanceID, evt)
 		return
 	}
@@ -482,6 +486,7 @@ func (h *Handler) blockOnPermission(w http.ResponseWriter, requestID, instanceID
 }
 
 func (h *Handler) handleBackgroundProcess(w http.ResponseWriter, instanceID string, evt HookEvent) {
+	log.Printf("[hooks] handleBackgroundProcess called: instance=%s session=%s cwd=%s input=%s", instanceID, evt.SessionID, evt.Cwd, string(evt.ToolInput))
 	var input struct {
 		Action    string `json:"action"`
 		Command   string `json:"command"`
@@ -516,11 +521,44 @@ func (h *Handler) handleBackgroundProcess(w http.ResponseWriter, instanceID stri
 		if name == "" {
 			name = input.Command
 		}
-		processID, err := h.bgprocess.Start(instanceID, name, input.Command, input.Port)
+		// Dedup: if an identical process was recently started for this instance, return it.
+		if existing := h.bgprocess.FindRecent(instanceID, input.Command, input.Port); existing != nil {
+			log.Printf("[hooks] dedup: returning existing process %s for %q", existing.ID, input.Command)
+			result = map[string]any{"process_id": existing.ID, "status": existing.Status, "name": existing.Name}
+			break
+		}
+		processID, err := h.bgprocess.Start(instanceID, name, input.Command, evt.Cwd, input.Port)
 		if err != nil {
 			result = map[string]any{"error": err.Error()}
 		} else {
-			result = map[string]any{"process_id": processID, "status": "started", "name": name}
+			// Auto-register port forward if the process has an associated port.
+			if input.Port > 0 && h.portforward != nil {
+				if pfErr := h.portforward.Start(instanceID, input.Port); pfErr != nil {
+					log.Printf("[hooks] auto port-forward for port %d failed: %v", input.Port, pfErr)
+				}
+			}
+			// Wait briefly to catch immediate failures (e.g. command not found).
+			time.Sleep(500 * time.Millisecond)
+			info := h.bgprocess.GetProcess(processID)
+			if info != nil && info.Status == "errored" {
+				errMsg := info.ExitError
+				if errMsg == "" {
+					errMsg = "process exited immediately"
+				}
+				output := string(info.Output())
+				result = map[string]any{
+					"process_id": processID,
+					"status":     "errored",
+					"error":      errMsg,
+					"output":     output,
+				}
+				// Clean up the port forward if the process failed immediately.
+				if input.Port > 0 && h.portforward != nil {
+					h.portforward.Stop(instanceID, input.Port)
+				}
+			} else {
+				result = map[string]any{"process_id": processID, "status": "started", "name": name}
+			}
 		}
 
 	case "stop":
