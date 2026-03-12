@@ -123,7 +123,8 @@ func main() {
 	mgr := instance.NewManager(nil, reg, cfg.ProjectDir) // sink set below
 
 	if !cfg.NoRelay {
-		relayClient = relay.NewClient(cfg.RelayURL, cfg.AgentID, cfg.Secret, func(env *protocol.Envelope) {
+		var relayErr error
+		relayClient, relayErr = relay.NewClient(cfg.RelayURL, cfg.AgentID, cfg.Secret, func(env *protocol.Envelope) {
 			// Messages from mobile → server.
 			switch env.Type {
 			case protocol.TypePermissionRespond:
@@ -319,6 +320,9 @@ func main() {
 				mgr.HandleMessage(env)
 			}
 		})
+		if relayErr != nil {
+			log.Fatalf("failed to create relay client: %v", relayErr)
+		}
 
 		eventSink = func(env *protocol.Envelope) {
 			if err := relayClient.Send(env); err != nil {

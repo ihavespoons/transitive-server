@@ -8,8 +8,8 @@ import (
 	"sync"
 	"time"
 
-	"github.com/ihavespoons/transitive/internal/protocol"
 	"github.com/gorilla/websocket"
+	"github.com/ihavespoons/transitive/internal/protocol"
 )
 
 // MessageHandler is called when a message arrives from the relay (from mobile).
@@ -20,6 +20,7 @@ type Client struct {
 	relayURL string
 	agentID  string
 	secret   string
+	key      []byte
 	handler  MessageHandler
 
 	mu   sync.Mutex
@@ -27,14 +28,19 @@ type Client struct {
 	done chan struct{}
 }
 
-func NewClient(relayURL, agentID, secret string, handler MessageHandler) *Client {
+func NewClient(relayURL, agentID, secret string, handler MessageHandler) (*Client, error) {
+	key, err := DeriveKey(secret, agentID)
+	if err != nil {
+		return nil, fmt.Errorf("derive e2e key: %w", err)
+	}
 	return &Client{
 		relayURL: relayURL,
 		agentID:  agentID,
 		secret:   secret,
+		key:      key,
 		handler:  handler,
 		done:     make(chan struct{}),
-	}
+	}, nil
 }
 
 // Connect establishes the WebSocket connection to the relay.
@@ -66,6 +72,30 @@ func (c *Client) Connect() error {
 	return nil
 }
 
+// relayInternalTypes are envelope types that the relay needs to inspect,
+// so they must NOT be encrypted.
+var relayInternalTypes = map[string]bool{
+	"device.token":              true,
+	"notification.preferences":  true,
+	protocol.TypeProxyRegister:   true,
+	protocol.TypeProxyUnregister: true,
+	protocol.TypeProxyResponse:   true,
+}
+
+// e2eEnvelope is the outer wrapper sent over the wire for encrypted messages.
+type e2eEnvelope struct {
+	E2E  bool    `json:"e2e"`
+	CT   string  `json:"ct"`
+	IV   string  `json:"iv"`
+	Hint e2eHint `json:"hint"`
+}
+
+// e2eHint contains minimal unencrypted metadata for the relay (e.g. push routing).
+type e2eHint struct {
+	Type       string `json:"type"`
+	InstanceID string `json:"instance_id,omitempty"`
+}
+
 // Send sends a protocol envelope to the relay (to mobile).
 func (c *Client) Send(env *protocol.Envelope) error {
 	c.mu.Lock()
@@ -76,9 +106,49 @@ func (c *Client) Send(env *protocol.Envelope) error {
 		return fmt.Errorf("not connected")
 	}
 
-	data, err := json.Marshal(env)
-	if err != nil {
-		return fmt.Errorf("marshal envelope: %w", err)
+	var data []byte
+
+	if relayInternalTypes[env.Type] {
+		// Send relay-internal messages as plain JSON envelopes.
+		var err error
+		data, err = json.Marshal(env)
+		if err != nil {
+			return fmt.Errorf("marshal envelope: %w", err)
+		}
+	} else {
+		// Encrypt all other messages with E2E.
+		plaintext, err := json.Marshal(env)
+		if err != nil {
+			return fmt.Errorf("marshal envelope for encryption: %w", err)
+		}
+
+		ct, iv, err := Encrypt(c.key, plaintext)
+		if err != nil {
+			return fmt.Errorf("encrypt envelope: %w", err)
+		}
+
+		// Extract instance_id from payload for the hint.
+		var payloadHint struct {
+			InstanceID string `json:"instance_id"`
+		}
+		if len(env.Payload) > 0 {
+			_ = json.Unmarshal(env.Payload, &payloadHint)
+		}
+
+		wrapper := e2eEnvelope{
+			E2E: true,
+			CT:  ct,
+			IV:  iv,
+			Hint: e2eHint{
+				Type:       env.Type,
+				InstanceID: payloadHint.InstanceID,
+			},
+		}
+
+		data, err = json.Marshal(wrapper)
+		if err != nil {
+			return fmt.Errorf("marshal e2e wrapper: %w", err)
+		}
 	}
 
 	c.mu.Lock()
@@ -130,9 +200,30 @@ func (c *Client) readLoop() {
 		log.Printf("relay received: %s", string(message))
 
 		var env protocol.Envelope
-		if err := json.Unmarshal(message, &env); err != nil {
-			log.Printf("relay invalid message: %v", err)
-			continue
+
+		// Check if this is an E2E encrypted message.
+		var peek struct {
+			E2E bool   `json:"e2e"`
+			CT  string `json:"ct"`
+			IV  string `json:"iv"`
+		}
+		if err := json.Unmarshal(message, &peek); err == nil && peek.E2E {
+			// Decrypt the inner envelope.
+			plaintext, err := Decrypt(c.key, peek.CT, peek.IV)
+			if err != nil {
+				log.Printf("relay e2e decrypt error: %v", err)
+				continue
+			}
+			if err := json.Unmarshal(plaintext, &env); err != nil {
+				log.Printf("relay invalid decrypted message: %v", err)
+				continue
+			}
+		} else {
+			// Plain (unencrypted) message -- backward compatibility.
+			if err := json.Unmarshal(message, &env); err != nil {
+				log.Printf("relay invalid message: %v", err)
+				continue
+			}
 		}
 
 		if c.handler != nil {
